@@ -7,7 +7,7 @@ on:
     branches: [ main, 'sprint/**', 'release/**' ]
   schedule:
     - cron: "32 2 * * 4"
-
+#xyz-testin purpose.
 jobs:
   analyze:
     name: Analyze the code
