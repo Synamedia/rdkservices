@@ -66,8 +66,8 @@
 using namespace std;
 
 #define API_VERSION_NUMBER_MAJOR 1
-#define API_VERSION_NUMBER_MINOR 1
-#define API_VERSION_NUMBER_PATCH 8
+#define API_VERSION_NUMBER_MINOR 2
+#define API_VERSION_NUMBER_PATCH 0
 
 #define MAX_REBOOT_DELAY 86400 /* 24Hr = 86400 sec */
 #define TR181_FW_DELAY_REBOOT "Device.DeviceInfo.X_RDKCENTRAL-COM_RFC.Feature.AutoReboot.fwDelayReboot"
@@ -138,6 +138,34 @@ bool setGzEnabled(bool enabled)
         printf(" GZ_FILE_ERROR: Can't open file for write mode\n");
     }
     return retVal;
+}
+
+const char* getWakeupSrcString(uint32_t src)
+{
+    
+    switch (src)
+    {
+    case WAKEUPSRC_VOICE:
+         return "WAKEUPSRC_VOICE";
+    case WAKEUPSRC_PRESENCE_DETECTION:
+         return "WAKEUPSRC_PRESENCE_DETECTION";
+    case WAKEUPSRC_BLUETOOTH:
+         return "WAKEUPSRC_BLUETOOTH";
+    case WAKEUPSRC_WIFI:
+         return "WAKEUPSRC_WIFI";
+    case WAKEUPSRC_IR:
+         return "WAKEUPSRC_IR";
+    case WAKEUPSRC_POWER_KEY:
+         return "WAKEUPSRC_POWER_KEY";
+    case WAKEUPSRC_TIMER:
+         return "WAKEUPSRC_TIMER";
+    case WAKEUPSRC_CEC:
+         return "WAKEUPSRC_CEC";
+    case WAKEUPSRC_LAN:
+         return "WAKEUPSRC_LAN";
+    default:
+         return "";
+    }
 }
 
 /**
@@ -329,6 +357,8 @@ namespace WPEFramework {
 	    m_ManufacturerDataModelNameValid = false;
             m_MfgSerialNumberValid = false;
 #endif
+            m_uploadLogsPid = -1;
+
             regcomp (&m_regexUnallowedChars, REGEX_UNALLOWABLE_INPUT, REG_EXTENDED);
 
             /**
@@ -420,9 +450,8 @@ namespace WPEFramework {
             registerMethod("getPowerStateIsManagedByDevice", &SystemServices::getPowerStateIsManagedByDevice, this);
     	    registerMethod("setTerritory", &SystemServices::setTerritory, this);
 	    registerMethod("getTerritory", &SystemServices::getTerritory, this);
-#ifdef ENABLE_SET_WAKEUP_SRC_CONFIG
             registerMethod("setWakeupSrcConfiguration", &SystemServices::setWakeupSrcConfiguration, this);
-#endif //ENABLE_SET_WAKEUP_SRC_CONFIG
+	    registerMethod("getWakeupSrcConfiguration", &SystemServices::getWakeupSrcConfiguration, this);
 
             // version 2 APIs
             registerMethod(_T("getTimeZones"), &SystemServices::getTimeZones, this);
@@ -431,6 +460,9 @@ namespace WPEFramework {
             registerMethod(_T("getLastWakeupKeyCode"), &SystemServices::getLastWakeupKeyCode, this);
 #endif
             registerMethod("uploadLogs", &SystemServices::uploadLogs, this);
+
+            registerMethod("uploadLogsAsync", &SystemServices::uploadLogsAsync, this);
+            registerMethod("abortLogUpload", &SystemServices::abortLogUpload, this);
 
             registerMethod("getPowerStateBeforeReboot", &SystemServices::getPowerStateBeforeReboot,
                     this);
@@ -450,6 +482,11 @@ namespace WPEFramework {
                 &SystemServices::getPlatformConfiguration, this);
         }
 
+#define RFC_LOG_UPLOAD "Device.DeviceInfo.X_RDKCENTRAL-COM_RFC.Feature.LogUploadBeforeDeepSleep.Enable"
+
+#define LOG_UPLOAD_STATUS_SUCCESS "UPLOAD_SUCCESS"
+#define LOG_UPLOAD_STATUS_FAILURE "UPLOAD_FAILURE"
+#define LOG_UPLOAD_STATUS_ABORTED "UPLOAD_ABORTED"
 
         SystemServices::~SystemServices()
         {
@@ -766,6 +803,35 @@ namespace WPEFramework {
          */
         void SystemServices::onSystemPowerStateChanged(string currentPowerState, string powerState)
         {
+
+            if ("LIGHT_SLEEP" == powerState || "STANDBY" == powerState) {
+                if ("ON" == currentPowerState) {
+                    RFC_ParamData_t param = {0};
+                    WDMP_STATUS status = getRFCParameter(NULL, RFC_LOG_UPLOAD, &param);
+                    if(WDMP_SUCCESS == status && param.type == WDMP_BOOLEAN && (strncasecmp(param.value,"true",4) == 0))
+                    {
+                        JsonObject p;
+                        JsonObject r;
+                        uploadLogsAsync(p, r);
+                    }
+                }
+            } else if ("DEEP_SLEEP" == powerState) {
+
+                pid_t uploadLogsPid = -1;
+
+                {
+                    lock_guard<mutex> lck(m_uploadLogsMutex);
+                    uploadLogsPid = m_uploadLogsPid;
+                }
+
+                if (-1 != uploadLogsPid)
+                {
+                    JsonObject p;
+                    JsonObject r;
+                    abortLogUpload(p, r);
+                }
+            }
+
             JsonObject params;
             params["powerState"] = powerState;
             params["currentPowerState"] = currentPowerState;
@@ -1008,7 +1074,7 @@ namespace WPEFramework {
 		LOGWARN("SystemService getDeviceInfo query %s", parameter.c_str());
 		IARM_Bus_MFRLib_GetSerializedData_Param_t param;
 		param.bufLen = 0;
-		param.type = mfrSERIALIZED_TYPE_SKYMODELNAME;
+		param.type = mfrSERIALIZED_TYPE_PROVISIONED_MODELNAME;
 		IARM_Result_t result = IARM_Bus_Call(IARM_BUS_MFRLIB_NAME, IARM_BUS_MFRLIB_API_GetSerializedData, &param, sizeof(param));
 		param.buffer[param.bufLen] = '\0';
 		LOGWARN("SystemService getDeviceInfo param type %d result %s", param.type, param.buffer);
@@ -1081,7 +1147,7 @@ namespace WPEFramework {
             param.bufLen = 0;
             param.type = mfrSERIALIZED_TYPE_MANUFACTURER;
             if (!parameter.compare(MODEL_NAME)) {
-                param.type = mfrSERIALIZED_TYPE_SKYMODELNAME;
+                param.type = mfrSERIALIZED_TYPE_PROVISIONED_MODELNAME;
             } else if (!parameter.compare(HARDWARE_ID)) {
                 param.type = mfrSERIALIZED_TYPE_HWID;
             }
@@ -2132,6 +2198,36 @@ namespace WPEFramework {
         }
 
         /***
+         * @brief : sends notification when time source state has changed.
+         *
+         */
+        void SystemServices::onLogUpload(int newState)
+        {
+            lock_guard<mutex> lck(m_uploadLogsMutex);
+
+            if (-1 != m_uploadLogsPid) {
+                JsonObject params;
+
+                params["logUploadStatus"] = newState == IARM_BUS_SYSMGR_LOG_UPLOAD_SUCCESS ? LOG_UPLOAD_STATUS_SUCCESS :
+                    newState == IARM_BUS_SYSMGR_LOG_UPLOAD_ABORTED ? LOG_UPLOAD_STATUS_ABORTED : LOG_UPLOAD_STATUS_FAILURE;
+
+                sendNotify(EVT_ONLOGUPLOAD, params);
+                GetHandler(2)->Notify(EVT_ONLOGUPLOAD, params);
+
+                pid_t wp;
+                int status;
+
+                if ((wp = waitpid(m_uploadLogsPid, &status, 0)) != m_uploadLogsPid) {
+                    LOGERR("Waitpid for failed: %d, status: %d", m_uploadLogsPid, status);
+                }
+
+                m_uploadLogsPid = -1;
+            } else {
+                LOGERR("Upload Logs script isn't runing");
+            }
+        }
+
+        /***
          * @brief : Worker to fetch details of various MAC addresses.
          * @Event : {"ecm_mac":"<MAC>","estb_mac":"<MAC>","moca_mac":"<MAC>",
          *     "eth_mac":"<MAC>","wifi_mac":"<MAC>","info":"Details fetch status",
@@ -2226,6 +2322,7 @@ namespace WPEFramework {
             sendNotify(EVT_ONTEMPERATURETHRESHOLDCHANGED, params);
         }
 
+
         /***
          * @brief : To set the Time to TZ_FILE.
          * @param1[in]	: {"params":{"timeZone":"<string>"}}
@@ -2235,7 +2332,7 @@ namespace WPEFramework {
         uint32_t SystemServices::setTimeZoneDST(const JsonObject& parameters,
                 JsonObject& response)
 	{
-		bool resp = false;
+		bool resp = true;
 		if (parameters.HasLabel("timeZone")) {
 			std::string dir = dirnameOf(TZ_FILE);
 			std::string timeZone = "";
@@ -2263,23 +2360,56 @@ namespace WPEFramework {
 							//Do nothing//
 						}
 						std::string oldTimeZoneDST = getTimeZoneDSTHelper();
+						
+						if (oldTimeZoneDST != timeZone) {
+							FILE *f = fopen(TZ_FILE, "w");
+							if (f) {
+								if (timeZone.size() != fwrite(timeZone.c_str(), 1, timeZone.size(), f))
+								{
+									LOGERR("Failed to write %s", TZ_FILE);
+									resp = false;
+								}
 
-						FILE *f = fopen(TZ_FILE, "w");
-						if (f) {
-							if (timeZone.size() != fwrite(timeZone.c_str(), 1, timeZone.size(), f))
-								LOGERR("Failed to write %s", TZ_FILE);
+								fflush(f);
+								fsync(fileno(f));
+								fclose(f);
 
-							fflush(f);
-							fsync(fileno(f));
-							fclose(f);
-							if (SystemServices::_instance)
-								SystemServices::_instance->onTimeZoneDSTChanged(oldTimeZoneDST,timeZone);
-							resp = true;
-						} else {
-							LOGERR("Unable to open %s file.\n", TZ_FILE);
-							populateResponseWithError(SysSrv_FileAccessFailed, response);
-							resp = false;
+							} else {
+								LOGERR("Unable to open %s file.\n", TZ_FILE);
+								populateResponseWithError(SysSrv_FileAccessFailed, response);
+								resp = false;
+							}
 						}
+
+						std::string oldAccuracy = getTimeZoneAccuracyDSTHelper();
+						std::string accuracy = oldAccuracy;
+
+						if (parameters.HasLabel("accuracy")) {
+							accuracy = parameters["accuracy"].String();
+							if (accuracy != TZ_ACCURACY_INITIAL && accuracy != TZ_ACCURACY_INTERIM && accuracy != TZ_ACCURACY_FINAL) {
+								LOGERR("Wrong TimeZone Accuracy: %s", accuracy.c_str());
+								accuracy = oldAccuracy;
+							}
+						}
+
+						if (accuracy != oldAccuracy) {
+							FILE *f = fopen(TZ_ACCURACY_FILE, "w");
+							if (f) {
+								if (accuracy.size() != fwrite(accuracy.c_str(), 1, accuracy.size(), f))
+								{
+									LOGERR("Failed to write %s", TZ_ACCURACY_FILE);
+									resp = false;
+								}
+
+								fflush(f);
+								fsync(fileno(f));
+								fclose(f);
+							}
+						}
+
+						if (SystemServices::_instance && (oldTimeZoneDST != timeZone || oldAccuracy != accuracy))
+							SystemServices::_instance->onTimeZoneDSTChanged(oldTimeZoneDST,timeZone,oldAccuracy, accuracy);
+
 					}
 					else{
 						LOGERR("Invalid timeZone  %s received. Timezone not supported in TZ Database. \n", timeZone.c_str());
@@ -2474,15 +2604,90 @@ namespace WPEFramework {
 		sendNotify(EVT_ONTERRITORYCHANGED, params);
 	}
 
-	void SystemServices::onTimeZoneDSTChanged(string oldTimeZone, string newTimeZone)
+	void SystemServices::onTimeZoneDSTChanged(string oldTimeZone, string newTimeZone, string oldAccuracy, string newAccuracy)
 	{
 		JsonObject params;
 		params["oldTimeZone"] = oldTimeZone;
 		params["newTimeZone"] = newTimeZone;
-		LOGWARN(" Notifying TimeZone changed - oldTimeZone: %s - newTimeZone: %s",oldTimeZone.c_str(),newTimeZone.c_str());
+		params["oldAccuracy"] = oldAccuracy;
+		params["newAccuracy"] = newAccuracy;
+		LOGWARN(" Notifying TimeZone changed - oldTimeZone: %s - newTimeZone: %s, oldAccuracy: %s - newAccuracy: %s",oldTimeZone.c_str(),newTimeZone.c_str(),oldAccuracy.c_str(),newAccuracy.c_str());
 		//Notify TimeZone changed
 		sendNotify(EVT_ONTIMEZONEDSTCHANGED, params);
 	}
+
+    uint32_t SystemServices::uploadLogsAsync(const JsonObject& parameters, JsonObject& response)
+    {
+        LOGWARN("");
+
+        pid_t uploadLogsPid = -1;
+
+        {
+            lock_guard<mutex> lck(m_uploadLogsMutex);
+            uploadLogsPid = m_uploadLogsPid;
+        }
+
+        if (-1 != uploadLogsPid) {
+            LOGWARN("Another instance of log upload script is running");
+            abortLogUpload(parameters, response);
+        }
+
+        lock_guard<mutex> lck(m_uploadLogsMutex);
+        m_uploadLogsPid = UploadLogs::logUploadAsync();
+
+        returnResponse(true);
+    }
+
+    uint32_t SystemServices::abortLogUpload(const JsonObject& parameters, JsonObject& response)
+    {
+
+        lock_guard<mutex> lck(m_uploadLogsMutex);
+
+        if (-1 != m_uploadLogsPid) {
+
+            // Kill child processes
+            std::stringstream cmd;
+            cmd << "pgrep -P " << m_uploadLogsPid;
+
+            FILE* fp = popen(cmd.str().c_str(), "r");
+            if (NULL != fp) {
+
+                char output[1024];
+                while (NULL != fgets (output, sizeof(output) - 1, fp)) {
+                    std::string line = output;
+                    line = trim(line);
+
+                    char *end;
+                    int pid = strtol(line.c_str(), &end, 10);
+
+                    if (line.c_str() != end && 0 != pid && 1 != pid) {
+                        kill(pid, SIGKILL);
+                    } else
+                        LOGERR("Bad pid: %d", pid);
+                }
+
+                pclose(fp);
+            } else {
+                LOGERR("Cannot run command\n");
+            }
+
+            kill(m_uploadLogsPid, SIGKILL);
+
+            int status;
+            waitpid(m_uploadLogsPid, &status, 0);
+
+            m_uploadLogsPid = -1;
+
+            JsonObject params;
+            params["logUploadStatus"] = LOG_UPLOAD_STATUS_ABORTED;
+            sendNotify(EVT_ONLOGUPLOAD, params);
+
+            returnResponse(true);
+        }
+
+        LOGERR("Upload logs script is not running");
+        returnResponse(false);
+    }
 
         /***
          * @brief : To fetch timezone from TZ_FILE.
@@ -2507,10 +2712,15 @@ namespace WPEFramework {
                     resp = false;
                 }
             } else {
-                LOGERR("File not found %s.\n", TZ_FILE);
-                populateResponseWithError(SysSrv_FileAccessFailed, response);
-                resp = false;
+                LOGERR("File not found %s, returning default.\n", TZ_FILE);
+                response["timeZone"] = TZ_DEFAULT;
+                resp = true;
             }
+
+            if (resp) {
+                response["accuracy"] = getTimeZoneAccuracyDSTHelper();
+            }
+
             returnResponse(resp);
         }
 
@@ -3374,22 +3584,6 @@ namespace WPEFramework {
 			reason = ((reason.length()) ? reason : "application");
             LOGINFO("SystemServices::setDevicePowerState state: %s\n", state.c_str());
 
-#if defined(LOGUPLOAD_BEFORE_DEEPSLEEP)
-            if ( "LIGHT_SLEEP" == state || "STANDBY" == state){
-                if ( "ON" == m_current_state){
-
-                    /* only if transition from ON -> LIGHT_SLEEP
-                     * perform logupload when state change to Standby */
-                    int32_t uploadStatus = UploadLogs::LogUploadBeforeDeepSleep();
-                    if ( E_NOK == uploadStatus ){
-                        LOGERR("SystemServices Logupload Disabled \n");
-                    }
-                    else {
-                        LOGINFO("LogUploadBeforeDeepSleep Success \n");
-                    }
-                }
-            }
-#endif
             if (state == "STANDBY") {
                 if (SystemServices::_instance) {
 					SystemServices::_instance->getPreferredStandbyMode(paramIn, paramOut);
@@ -3716,11 +3910,9 @@ namespace WPEFramework {
 
             returnResponse(retVal);
         }
-
-#ifdef ENABLE_SET_WAKEUP_SRC_CONFIG
-	/***
+        /***
          * @brief : To set the wakeup source configuration.
-         * @param1[in] : {"params":{ "wakeupSrc": <int>, "config": <int>}
+         * @param1[in] : {"params":{"powerState":<string>,"wakeupSources":[{<WakeupSrcTrigger string>:<bool>},...]}
          * @param2[out] : {"result":{"success":<bool>}}
          * @return     : Core::<StatusCode>
          */
@@ -3728,55 +3920,119 @@ namespace WPEFramework {
                 JsonObject& response)
         {
             bool status = false;
-            string src, value;
-            WakeupSrcType_t srcType;
-            bool config;
-            int paramErr = 0;
-            IARM_Bus_PWRMgr_SetWakeupSrcConfig_Param_t param;
-            if (parameters.HasLabel("wakeupSrc") && parameters.HasLabel("config")) {
-                src = parameters["wakeupSrc"].String();
-                srcType = (WakeupSrcType_t)atoi(src.c_str());
-                value = parameters["config"].String();
-                config = (bool)atoi(value.c_str());
-
-                switch(srcType){
-                    case WAKEUPSRC_VOICE:
-                    case WAKEUPSRC_PRESENCE_DETECTION:
-                    case WAKEUPSRC_BLUETOOTH:
-                    case WAKEUPSRC_WIFI:
-                    case WAKEUPSRC_IR:
-                    case WAKEUPSRC_POWER_KEY:
-                    case WAKEUPSRC_TIMER:
-                    case WAKEUPSRC_CEC:
-                    case WAKEUPSRC_LAN:
-                        param.srcType = srcType;
-                        param.config = config;
-                        break;
-                    default:
-                        LOGERR("setWakeupSrcConfiguration invalid parameter\n");
-                        status = false;
-                        paramErr = 1;
+            unsigned int srcType = 0x0;
+            unsigned int config = 0x0;
+            unsigned int powerState = 0x0;
+            LOGWARN(" %s: %d Entry \n",__FUNCTION__,__LINE__);
+            if (parameters.HasLabel("powerState")) 
+            {
+                string state = parameters["powerState"].String();
+                if(!state.compare("LIGHT_SLEEP"))
+                    powerState = 1 << IARM_BUS_PWRMGR_POWERSTATE_STANDBY_LIGHT_SLEEP;
+                if(!state.compare("DEEP_SLEEP"))
+                    powerState =  1 << IARM_BUS_PWRMGR_POWERSTATE_STANDBY_DEEP_SLEEP;
+                if(!state.compare("DEFAULT"))
+                    powerState = (1<<IARM_BUS_PWRMGR_POWERSTATE_STANDBY_LIGHT_SLEEP) | \
+                                             (1 << IARM_BUS_PWRMGR_POWERSTATE_STANDBY_DEEP_SLEEP);
+            }
+            else{
+                    powerState = (1<<IARM_BUS_PWRMGR_POWERSTATE_STANDBY_LIGHT_SLEEP) | \
+                                             (1 << IARM_BUS_PWRMGR_POWERSTATE_STANDBY_DEEP_SLEEP);
+            }
+            LOGWARN("%s: %d Power State stored:%x \r\n",__FUNCTION__,__LINE__,powerState);
+            if (parameters.HasLabel("wakeupSources")) 
+            {
+                JsonArray wakeupSrcs = parameters["wakeupSources"].Array();
+                for(uint32_t i =0; i<wakeupSrcs.Length();i++)
+                {
+                    JsonObject wakeupSrc = wakeupSrcs.Get(i).Object();
+                    for(uint32_t src = WAKEUPSRC_VOICE; src < WAKEUPSRC_MAX; src++)
+                    {
+                        if(wakeupSrc.HasLabel(getWakeupSrcString(src)))
+                        {
+                            srcType |= (1<<src);
+                            if(wakeupSrc[getWakeupSrcString(src)].Boolean())
+                            {
+                                config |= (1<<src);
+                            }
+                            if((src == WAKEUPSRC_WIFI) || (src == WAKEUPSRC_LAN))
+                            {
+                                m_networkStandbyModeValid = false;
+                            }
+                            break;
+                        }
+                    }
                 }
-
-                if(paramErr == 0) {
-
+                LOGWARN(" %s: %d srcType:%x  config :%x \n",__FUNCTION__,__LINE__,srcType ,config);
+                if(srcType) {
+                    IARM_Bus_PWRMgr_WakeupSrcConfig_Param_t param;
+                    param.pwrMode = powerState;
+                    param.srcType = srcType;
+                    param.config = config;
                     IARM_Result_t res = IARM_Bus_Call(IARM_BUS_PWRMGR_NAME,
                                            IARM_BUS_PWRMGR_API_SetWakeupSrcConfig, (void *)&param,
                                            sizeof(param));
-
                     if (IARM_RESULT_SUCCESS == res) {
                         status = true;
                     } else {
                         status = false;
                     }
                 }
-            } else {
-                LOGERR("setWakeupSrcConfiguration Missing Key Values\n");
-                populateResponseWithError(SysSrv_MissingKeyValues, response);
             }
             returnResponse(status);
         }
-#endif //ENABLE_SET_WAKEUP_SRC_CONFIG
+        
+        /***
+         * @brief : To get the wakeup source configuration.
+         * @param1[out] : {"params":{"powerState":<string>,"wakeupSources":[{<WakeupSrcTrigger string>:<bool>},...]}
+         * @param2[out] : {"result":{"success":<bool>}}
+         * @return     : Core::<StatusCode>
+         */
+
+        uint32_t SystemServices::getWakeupSrcConfiguration(const JsonObject& parameters,
+                JsonObject& response)
+        {
+            JsonArray wakeupSrc;
+            IARM_Bus_PWRMgr_WakeupSrcConfig_Param_t param;
+            bool status = false;
+            IARM_Result_t res = IARM_Bus_Call(IARM_BUS_PWRMGR_NAME,
+                                  IARM_BUS_PWRMGR_API_GetWakeupSrcConfig, (void *)&param,
+                                  sizeof(param));
+            if (IARM_RESULT_SUCCESS == res) {
+                LOGWARN(" %s: %d res:%d srcType :%x  config :%x \n",__FUNCTION__,__LINE__,res,param.srcType,param.config);
+                status = true;
+                for(uint32_t src = WAKEUPSRC_VOICE; src <  WAKEUPSRC_MAX; src++)
+                {
+                     JsonObject sourceConfig;
+                     if(param.srcType & (1<<src))
+                     {
+                        sourceConfig[getWakeupSrcString(src)] = (param.config & (1<<src))?true:false;
+                        wakeupSrc.Add(sourceConfig);
+                     }
+                }
+                if(param.pwrMode == (1<<IARM_BUS_PWRMGR_POWERSTATE_STANDBY_LIGHT_SLEEP) )
+                {
+                    response["powerState"] = "LIGHT_SLEEP";
+                }
+                else if(param.pwrMode == (1 << IARM_BUS_PWRMGR_POWERSTATE_STANDBY_DEEP_SLEEP))
+                {
+                    response["powerState"] = "DEEP_SLEEP";
+                }
+                else
+                {
+                    response["powerState"] = "DEFAULT";
+                }
+                if(wakeupSrc.Length() > 0)
+                {
+                    response["wakeupSources"] = wakeupSrc;
+                }
+
+            } else {
+               status = false;
+            }
+            returnResponse(status);
+        }
+
 
         /***
          * @brief : To handle the event of Power State change.
@@ -3934,6 +4190,17 @@ namespace WPEFramework {
                             }
                         }
                     } break;
+                case IARM_BUS_SYSMGR_SYSSTATE_LOG_UPLOAD:
+                    {
+                        LOGWARN("IARMEvt: IARM_BUS_SYSMGR_SYSSTATE_LOG_UPLOAD = '%d'", state);
+                        if (SystemServices::_instance)
+                        {
+                            SystemServices::_instance->onLogUpload(state);
+                        } else {
+                            LOGERR("SystemServices::_instance is NULL.\n");
+                        }
+                    } break;
+
 
                 default:
                     /* Nothing to do. */;

@@ -78,6 +78,14 @@ WK_EXPORT void WKPreferencesSetPageCacheEnabled(WKPreferencesRef preferences, bo
 #include "LoggingUtils.h"
 #endif
 
+
+#if !WEBKIT_GLIB_API
+#define HAS_MEMORY_PRESSURE_SETTINGS_API 0
+#else
+#define HAS_MEMORY_PRESSURE_SETTINGS_API WEBKIT_CHECK_VERSION(2, 38, 0)
+#endif
+
+
 namespace WPEFramework {
 namespace Plugin {
 
@@ -479,6 +487,29 @@ static GSourceFuncs _handlerIntervention =
             };
 
         public:
+            class MemorySettings : public Core::JSON::Container {
+            public:
+                MemorySettings(const MemorySettings&) = delete;
+                MemorySettings& operator=(const MemorySettings&) = delete;
+
+                MemorySettings()
+                    : Core::JSON::Container()
+                    , WebProcessLimit()
+                    , NetworkProcessLimit()
+                {
+                    Add(_T("webprocesslimit"), &WebProcessLimit);
+                    Add(_T("networkprocesslimit"), &NetworkProcessLimit);
+                }
+                ~MemorySettings()
+                {
+                }
+
+            public:
+                Core::JSON::DecUInt32 WebProcessLimit;
+                Core::JSON::DecUInt32 NetworkProcessLimit;
+            };
+
+        public:
             Config()
                 : Core::JSON::Container()
                 , UserAgent()
@@ -505,7 +536,7 @@ static GSourceFuncs _handlerIntervention =
                 , MSEBuffers()
                 , ThunderDecryptorPreference()
                 , MemoryProfile()
-                , MemoryPressure()
+                , Memory()
                 , MediaContentTypesRequiringHardwareSupport()
                 , MediaDiskCache(true)
                 , DiskCache()
@@ -569,7 +600,7 @@ static GSourceFuncs _handlerIntervention =
                 Add(_T("msebuffers"), &MSEBuffers);
                 Add(_T("thunderdecryptorpreference"), &ThunderDecryptorPreference);
                 Add(_T("memoryprofile"), &MemoryProfile);
-                Add(_T("memorypressure"), &MemoryPressure);
+                Add(_T("memory"), &Memory);
                 Add(_T("mediacontenttypesrequiringhardwaresupport"), &MediaContentTypesRequiringHardwareSupport);
                 Add(_T("mediadiskcache"), &MediaDiskCache);
                 Add(_T("diskcache"), &DiskCache);
@@ -640,7 +671,7 @@ static GSourceFuncs _handlerIntervention =
             Core::JSON::String MSEBuffers;
             Core::JSON::Boolean ThunderDecryptorPreference;
             Core::JSON::String MemoryProfile;
-            Core::JSON::String MemoryPressure;
+            MemorySettings Memory;
             Core::JSON::String MediaContentTypesRequiringHardwareSupport;
             Core::JSON::Boolean MediaDiskCache;
             Core::JSON::String DiskCache;
@@ -835,6 +866,12 @@ static GSourceFuncs _handlerIntervention =
             Block();
 
             if (_loop != nullptr) {
+                if (g_main_loop_is_running(_loop) == FALSE) {
+                    g_main_context_invoke(_context, [](gpointer data) -> gboolean {
+                        g_main_loop_quit(reinterpret_cast<GMainLoop*>(data));
+                        return G_SOURCE_REMOVE;
+                    }, _loop);
+                }
                 g_main_loop_quit(_loop);
             }
 
@@ -2019,14 +2056,14 @@ static GSourceFuncs _handlerIntervention =
 
             _adminLock.Unlock();
         }
-        void OnLoadFailed()
+        void OnLoadFailed(const string& URL)
         {
             _adminLock.Lock();
 
             std::list<Exchange::IWebBrowser::INotification*>::iterator index(_notificationClients.begin());
 
             while (index != _notificationClients.end()) {
-                (*index)->LoadFailed(_URL);
+                (*index)->LoadFailed(URL);
                 index++;
             }
 
@@ -2159,9 +2196,18 @@ static GSourceFuncs _handlerIntervention =
             }
 
             // Memory Pressure
-            if (_config.MemoryPressure.Value().empty() == false) {
-                Core::SystemInfo::SetEnvironment(_T("WPE_POLL_MAX_MEMORY"), _config.MemoryPressure.Value(), !environmentOverride);
+#if !HAS_MEMORY_PRESSURE_SETTINGS_API
+            std::stringstream limitStr;
+            if ((_config.Memory.IsSet() == true) && (_config.Memory.NetworkProcessLimit.IsSet() == true)) {
+                limitStr << "networkprocess:" << _config.Memory.NetworkProcessLimit.Value() << "m";
             }
+            if ((_config.Memory.IsSet() == true) && (_config.Memory.WebProcessLimit.IsSet() == true)) {
+                limitStr << (!limitStr.str().empty() ? "," : "") << "webprocess:" << _config.Memory.WebProcessLimit.Value() << "m";
+            }
+            if (!limitStr.str().empty()) {
+                Core::SystemInfo::SetEnvironment(_T("WPE_POLL_MAX_MEMORY"), limitStr.str(), !environmentOverride);
+            }
+#endif
 
             // Memory Profile
             if (_config.MemoryProfile.Value().empty() == false) {
@@ -2540,7 +2586,8 @@ static GSourceFuncs _handlerIntervention =
         {
             if (type == WEBKIT_POLICY_DECISION_TYPE_RESPONSE) {
                 auto *response = webkit_response_policy_decision_get_response(WEBKIT_RESPONSE_POLICY_DECISION(decision));
-                browser->SetResponseHTTPStatusCode(webkit_uri_response_get_status_code(response));
+                if (webkit_uri_response_is_main_frame(response))
+                    browser->SetResponseHTTPStatusCode(webkit_uri_response_get_status_code(response));
             }
             webkit_policy_decision_use(decision);
             return TRUE;
@@ -2556,7 +2603,14 @@ static GSourceFuncs _handlerIntervention =
                     browser->_ignoreLoadFinishedOnce = false;
                     return;
                 }
-                browser->OnLoadFinished(Core::ToString(webkit_web_view_get_uri(webView)));
+                const std::string uri = webkit_web_view_get_uri(webView);
+                if (browser->_httpStatusCode < 0 && uri.find("http", 0, 4) != std::string::npos &&
+                    webkit_web_view_get_estimated_load_progress(webView) < 1.0)
+                {
+                    // Load failed or there is another load in progress already
+                    return;
+                }
+                browser->OnLoadFinished(Core::ToString(uri.c_str()));
             }
         }
         static void loadFailedCallback(WebKitWebView*, WebKitLoadEvent loadEvent, const gchar* failingURI, GError* error, WebKitImplementation* browser)
@@ -2567,9 +2621,9 @@ static GSourceFuncs _handlerIntervention =
                 browser->_ignoreLoadFinishedOnce = true;
                 return;
             }
-            browser->OnLoadFailed();
+            browser->OnLoadFailed(failingURI);
         }
-        static void webProcessTerminatedCallback(VARIABLE_IS_NOT_USED WebKitWebView* webView, WebKitWebProcessTerminationReason reason)
+        static void webProcessTerminatedCallback(VARIABLE_IS_NOT_USED WebKitWebView* webView, WebKitWebProcessTerminationReason reason, WebKitImplementation* browser)
         {
             switch (reason) {
             case WEBKIT_WEB_PROCESS_CRASHED:
@@ -2582,7 +2636,12 @@ static GSourceFuncs _handlerIntervention =
                 SYSLOG(Trace::Fatal, (_T("CRASH: WebProcess terminated by API")));
                 break;
             }
-            exit(1);
+            g_signal_handlers_block_matched(webView, G_SIGNAL_MATCH_DATA, 0, 0, nullptr, nullptr, browser);
+            struct ExitJob : public Core::IDispatch
+            {
+                virtual void Dispatch() { exit(1); }
+            };
+            Core::IWorkerPool::Instance().Submit(Core::proxy_cast<Core::IDispatch>(Core::ProxyType<ExitJob>::Create()));
         }
         static void closeCallback(VARIABLE_IS_NOT_USED WebKitWebView* webView, WebKitImplementation* browser)
         {
@@ -2694,6 +2753,14 @@ static GSourceFuncs _handlerIntervention =
                     indexedDBSizeBytes = _config.IndexedDBSize.Value() * 1024;
                 }
 
+#if HAS_MEMORY_PRESSURE_SETTINGS_API
+                if ((_config.Memory.IsSet() == true) && (_config.Memory.NetworkProcessLimit.IsSet() == true)) {
+                    WebKitMemoryPressureSettings* memoryPressureSettings = webkit_memory_pressure_settings_new();
+                    webkit_memory_pressure_settings_set_memory_limit(memoryPressureSettings, _config.Memory.NetworkProcessLimit.Value());
+                    webkit_website_data_manager_set_memory_pressure_settings(memoryPressureSettings);
+                    webkit_memory_pressure_settings_free(memoryPressureSettings);
+                }
+#endif
                 auto* websiteDataManager = webkit_website_data_manager_new(
                     "local-storage-directory", wpeStoragePath,
                     "disk-cache-directory", wpeDiskCachePath,
@@ -2705,7 +2772,18 @@ static GSourceFuncs _handlerIntervention =
                 g_free(wpeDiskCachePath);
                 g_free(indexedDBPath);
 
-                wkContext = webkit_web_context_new_with_website_data_manager(websiteDataManager);
+#if HAS_MEMORY_PRESSURE_SETTINGS_API
+                if ((_config.Memory.IsSet() == true) && (_config.Memory.WebProcessLimit.IsSet() == true)) {
+                    WebKitMemoryPressureSettings* memoryPressureSettings = webkit_memory_pressure_settings_new();
+                    webkit_memory_pressure_settings_set_memory_limit(memoryPressureSettings, _config.Memory.WebProcessLimit.Value());
+                    // Pass web process memory pressure settings to WebKitWebContext constructor
+                    wkContext = WEBKIT_WEB_CONTEXT(g_object_new(WEBKIT_TYPE_WEB_CONTEXT, "website-data-manager", websiteDataManager, "memory-pressure-settings", memoryPressureSettings, nullptr));
+                    webkit_memory_pressure_settings_free(memoryPressureSettings);
+                } else
+#endif
+                {
+                    wkContext = webkit_web_context_new_with_website_data_manager(websiteDataManager);
+                }
                 g_object_unref(websiteDataManager);
             }
 
@@ -2792,6 +2870,7 @@ static GSourceFuncs _handlerIntervention =
                 _config.UserAgent = webkit_settings_get_user_agent(preferences);
             }
 
+            webkit_settings_set_enable_html5_local_storage(preferences, _localStorageEnabled);
             webkit_settings_set_enable_html5_database(preferences, _config.IndexedDBEnabled.Value());
 
             // webaudio support
@@ -2799,11 +2878,17 @@ static GSourceFuncs _handlerIntervention =
 
             // Allow mixed content.
             bool enableWebSecurity = _config.Secure.Value();
+#if WEBKIT_CHECK_VERSION(2, 38, 0)
+            g_object_set(G_OBJECT(preferences),
+                     "disable-web-security", !enableWebSecurity,
+                     "allow-running-of-insecure-content", !enableWebSecurity,
+                     "allow-display-of-insecure-content", !enableWebSecurity, nullptr);
+#else
             g_object_set(G_OBJECT(preferences),
                      "enable-websecurity", enableWebSecurity,
                      "allow-running-of-insecure-content", !enableWebSecurity,
                      "allow-display-of-insecure-content", !enableWebSecurity, nullptr);
-
+#endif
             _view = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
                 "backend", webkit_web_view_backend_new(wpe_view_backend_create(), nullptr, nullptr),
                 "web-context", wkContext,
@@ -2838,7 +2923,7 @@ static GSourceFuncs _handlerIntervention =
             g_signal_connect(_view, "decide-policy", reinterpret_cast<GCallback>(decidePolicyCallback), this);
             g_signal_connect(_view, "notify::uri", reinterpret_cast<GCallback>(uriChangedCallback), this);
             g_signal_connect(_view, "load-changed", reinterpret_cast<GCallback>(loadChangedCallback), this);
-            g_signal_connect(_view, "web-process-terminated", reinterpret_cast<GCallback>(webProcessTerminatedCallback), nullptr);
+            g_signal_connect(_view, "web-process-terminated", reinterpret_cast<GCallback>(webProcessTerminatedCallback), this);
             g_signal_connect(_view, "close", reinterpret_cast<GCallback>(closeCallback), this);
             g_signal_connect(_view, "permission-request", reinterpret_cast<GCallback>(decidePermissionCallback), nullptr);
             g_signal_connect(_view, "show-notification", reinterpret_cast<GCallback>(showNotificationCallback), this);
@@ -3561,7 +3646,7 @@ static GSourceFuncs _handlerIntervention =
             return;
 
         WebKitImplementation* browser = const_cast<WebKitImplementation*>(static_cast<const WebKitImplementation*>(clientInfo));
-        browser->OnLoadFailed();
+        browser->OnLoadFailed(url);
     }
 
     /* static */ void webProcessDidCrash(WKPageRef, const void*)
