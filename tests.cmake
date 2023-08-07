@@ -69,6 +69,7 @@ set(EMPTY_HEADERS
         ${BASEDIR}/rdk/iarmmgrs-hal/sysMgr.h
         ${BASEDIR}/network/wifiSrvMgrIarmIf.h
         ${BASEDIR}/network/netsrvmgrIarm.h
+	${BASEDIR}/network/secure_wrapper.h
 	${BASEDIR}/rdkshell/rdkshellevents.h
         ${BASEDIR}/rdkshell/rdkshell.h
         ${BASEDIR}/rdkshell/compositorcontroller.h
